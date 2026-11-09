@@ -1,120 +1,119 @@
 # MediaMigrate
 
 Migrate legacy MediaViewer movie and TV storage to Backblaze B2 without
-replacing the original files or recreating library records.
+replacing original files or recreating library records. MediaMigrate accesses
+MediaViewer only through its REST API; it does not require a MediaViewer
+checkout, Django, or a local database connection.
 
-## Safety and scope
+## Safety and prerequisites
 
-- A batch counts **MediaPath records**, not individual movies, episodes, or
-  upload requests. One TV path can contain many episodes.
-- All episodes on a TV path, including hidden episodes, must migrate before
-  its shared path changes to B2. Hidden flags and record IDs remain unchanged.
-- Existing MediaViewer-encoded video and WebVTT subtitles upload byte for
-  byte. This tool does not encode, probe codecs, or require FFmpeg. Source
-  compatibility is assumed; source files remain untouched.
-- MediaViewer must be available locally with its Django dependencies,
-  configured database, and access to the original media paths. No new public
-  migration API is needed.
-- Migration uses the existing MediaViewer B2 settings and its object-key
-  layout. Do not point development verification at a production bucket.
-- Database backups and independent playback checks remain the operator's
-  responsibility. Do not delete original files merely because migration
-  reports success.
+- A batch counts candidate `MediaPath` records, not individual episodes or
+  upload requests. Failed candidates count toward the batch limit.
+- The API supplies a bounded, primary-key-ordered inventory. TV children,
+  including hidden episodes, are included and published together.
+- Existing encoded video and WebVTT subtitles upload byte for byte. Sources
+  remain unchanged; FFmpeg is not required. Source paths returned by the API
+  must be reachable at the same paths on the migration host.
+- The deployment must provide the `migrations/run/`,
+  `migrations/candidates/`, and `migrations/{pk}/publish/` endpoints, including
+  durable single-run ownership and atomic snapshot-CAS publication. Deploy the
+   migration API and schema update in MediaViewer,
+  then run `python manage.py migrate` in the MediaViewer server deployment
+  before using this client. These backend changes are not part of this client
+  package.
+- Authenticate with staff Basic Auth or an `Authorization: Token ...` token.
+  Token authentication works only when the server has token authentication and
+   its token model configured. Basic Auth works with the default server setup. TLS
+  verification is enabled. HTTP is accepted only for loopback development
+  endpoints. Never put credentials in command-line arguments.
+- Keep filesystem/database writers paused throughout apply. The ownership
+  record coordinates migrators; it does not pause writers itself.
+- Do not delete source files after success. Independently verify playback and
+  backups before resuming production writers.
 
-## Requirements
-
-Use Python 3.11 or newer in the environment containing MediaViewer and its dependencies, with
-access to its Django settings and PostgreSQL database. Use the accompanying
-MediaViewer B2 client updates. No new database migration is required.
-
-Configure MediaViewer's existing `B2_APPLICATION_KEY_ID`,
-`B2_APPLICATION_KEY`, `B2_BUCKET_NAME`, `B2_NAME_PREFIX`, and optionally
-`B2_API_URL`. The application key needs `writeFiles`, `listFiles`, and
-`shareFiles`. Use a private bucket with the same playback/CORS configuration
-as existing MediaViewer B2 media. Never put keys in command-line arguments.
-
-Source files must already be encoded for MediaViewer. Subtitles must already
-be WebVTT; unsupported subtitle formats fail rather than being renamed or
-silently discarded. Keep source files unchanged throughout migration.
-TV parent-level subtitle metadata is rejected because it cannot be safely
-assigned to episodes; store explicit TV caption references on each MediaFile.
-
-## Run a batch
-
-Run from this repository using MediaViewer's Python environment:
+Install standalone, with pytest for development:
 
 ```sh
-python -m mediamigrate 10 \
-  --mediaviewer ../MediaViewer \
-  --settings mysite.settings
+python -m pip install -e '.[dev]'
 ```
 
-This is a **dry run**: inspect candidates and validate file references without
-uploading or changing records. The integer is a maximum number of records
-attempted, not a target number of successful migrations. Failed records count
-toward that limit. Records are considered in primary-key order; already-B2
-and skipped paths are excluded.
-
-Before applying, back up the database and pause MediaConverter, library
-scanners, the existing `upload_to_b2` command, and any other process that
-changes the selected media files or records. Source files must remain
-immutable during hashing, upload, verification, and publication. Then
-explicitly acknowledge this:
+Configure credentials through environment variables:
 
 ```sh
-python -m mediamigrate 10 \
-  --mediaviewer ../MediaViewer \
-  --settings mysite.settings \
-  --apply --writers-paused
+export MM_API_URL='https://viewer/mediaviewer/api/'
+export MM_API_USERNAME='staff-user'
+export MM_API_PASSWORD='secret'
+# Alternatively, use a token instead of Basic Auth:
+# export MM_API_TOKEN='configured-server-token'
+export MM_B2_APPLICATION_KEY_ID='key-id'
+export MM_B2_APPLICATION_KEY='key-secret'
+export MM_B2_API_URL='https://api.backblazeb2.com' # optional
 ```
 
-One migrator can apply at a time per PostgreSQL database. The advisory lock
-does not stop other tools from writing: the pause is a real operating
-requirement, not an automatic maintenance mode. The final database transaction
-rejects changes to the inspected record inventory or source files.
-Use a stable PostgreSQL session, not a transaction-pooling connection.
-Integrity checks reread complete source files, including a final check while
-database rows are locked; allow for this when planning the maintenance window.
+The B2 application key needs upload and file-list permissions for the selected
+bucket. Bucket and object prefix normally come from each API candidate's
+server-defined target. Optional `--bucket` and `--prefix` override those API
+target choices. Sharding is always determined by the server.
+
+## Dry run and apply
+
+```sh
+python -m mediamigrate 10
+```
+
+Dry run validates local source files and candidate metadata. It does not acquire
+run ownership, access B2, or publish changes. The number is the maximum number
+of API candidates processed, including failures.
+
+Pause all media and database writers, then explicitly acknowledge the pause:
+
+```sh
+python -m mediamigrate 10 --apply --writers-paused
+```
+
+Apply creates a run UUID and acquires durable singleton ownership before
+fetching candidates. The client verifies source fingerprints immediately
+before publication. The server must validate run ownership and the opaque
+snapshot token, then atomically publish the complete manifest. No migration
+record is changed through separate CRUD requests. B2 uploads are direct from
+the client and verified by exact key, size, and checksum before publication.
 
 ## Failure and recovery
 
-Rerun with the same settings and unchanged originals. Completed remote
-objects are reused only when the exact key, size, and checksum match.
-Malformed listing responses, conflicting versions, hide markers, or
-unfinished multipart uploads fail closed rather than overwrite media or
-start another billable upload blindly.
+Ownership is released only when every candidate in the acquired batch completes
+successfully. Any candidate failure or uncertain request outcome retains the
+ownership record for manual recovery. The diagnostic prints the run UUID. Do
+not clear ownership until confirming the old process and its uploads have
+stopped. Inspect active ownership, then release the matching run only after
+reconciling published records and remote objects:
 
-An upload and a database commit cannot form one distributed transaction.
-Completed orphan objects and unfinished multipart parts may remain billable
-after interruption. Inspect them in Backblaze's console before any cleanup;
-never delete an object referenced by published records. Resolve unfinished
-uploads deliberately before retrying. This tool does not delete remote
-objects or source files.
+```sh
+curl --fail --user "$MM_API_USERNAME:$MM_API_PASSWORD" "${MM_API_URL%/}/migrations/run/"
+curl --fail --user "$MM_API_USERNAME:$MM_API_PASSWORD" \
+  -X DELETE -H 'Content-Type: application/json' \
+  --data '{"run_id":"UUID-FROM-INSPECTION"}' "${MM_API_URL%/}/migrations/run/"
+```
 
-Unsupported subtitles, missing files, ambiguous movie selection, and
-unsafe paths block that record. Fix the source inventory before retrying;
-do not bypass failed checks merely to move the batch forward.
-Symbolic-link media files are rejected, including links within the same directory.
+For token auth, replace `--user` with
+`-H "Authorization: Token $MM_API_TOKEN"`. API redirects are refused to
+prevent credential forwarding. Requests have bounded timeouts and are never
+automatically retried. An ambiguous publication failure may have committed
+server-side; reconcile records before any manual release or rerun.
 
-Exit status is `0` for a successful batch (including an empty batch), `1` for
-migration failures, and `2` for invalid CLI arguments or a missing apply
-acknowledgement. The summary reports attempted, succeeded, and failed counts;
-in dry-run mode, succeeded means validation passed, not that data was moved.
+Completed orphan B2 objects or unfinished multipart parts may remain after an
+interruption. Inspect them before cleanup; never delete objects referenced by
+published records. Unsafe paths, missing/empty files, ambiguous movie
+selection, unsupported subtitles, and changed source bytes fail closed.
 
-After success, open a migrated movie and TV episode in MediaViewer's B2
-player. Check seeking, sound, captions, resume progress, and hidden-episode
-metadata before resuming writers. Cast/device compatibility and production
-B2 permissions require separate verification in the target environment.
+Exit status is `0` for a successful batch, `1` for migration/API failures, and
+`2` when apply lacks `--writers-paused` or arguments are invalid. In dry-run
+mode, succeeded means validation passed, not that data moved.
 
 ## Tests
 
-Run `python -m pytest -q` in the MediaViewer Python environment with pytest
-and pytest-django installed. Pure validation and storage tests need no media
-tools. Database integration tests require explicitly configured isolated
-PostgreSQL settings named `mv_test_settings`, `DJANGO_SETTINGS_MODULE` set to
-that module, and `MV_ROOT` pointing at the MediaViewer checkout. Put both the
-isolated settings module and MediaViewer on `PYTHONPATH`. These tests create
-and destroy a test database; never configure them against production.
+Run the standalone test suite without MediaViewer, Django, a database, or live
+services:
 
-The HTTP integration fixture uses an ephemeral loopback server and temporary
-media files. It does not access a real B2 account or verify browser decoding.
+```sh
+python -m pytest -q
+```

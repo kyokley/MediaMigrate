@@ -1,10 +1,12 @@
-import copy
 import os
 import re
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
+from .client import MediaViewerClient
 from .storage import object_uuid, upload_verified
 
 VIDEO_SUFFIXES = {
@@ -12,8 +14,7 @@ VIDEO_SUFFIXES = {
     ".mpg", ".mpe", ".mpv", ".m2v", ".ts", ".m2ts", ".mts", ".3gp",
     ".flv", ".ogv", ".vob", ".divx", ".f4v", ".mxf",
 }
-LOCK_NAMESPACE = 0x4D4D
-LOCK_KEY = 0x20250308
+MAX_BATCH_SIZE = 1000
 
 
 @dataclass
@@ -27,67 +28,123 @@ class MigrationRunner:
     def __init__(self, args):
         self.args = args
         self.summary = Summary()
-        self._setup_django()
-
-    def _setup_django(self):
-        viewer = Path(self.args.mediaviewer).resolve()
-        if not viewer.is_dir():
-            raise RuntimeError("MediaViewer checkout does not exist")
-        sys.path.insert(0, str(viewer))
-        os.environ["DJANGO_SETTINGS_MODULE"] = self.args.settings
-        import django
-        django.setup()
-        from django.conf import settings
-        if self.args.bucket:
-            settings.B2_BUCKET_NAME = self.args.bucket
-        if self.args.prefix is not None:
-            settings.B2_NAME_PREFIX = self.args.prefix
-        self.settings = settings
+        self.settings = SimpleNamespace(
+            B2_APPLICATION_KEY_ID=os.environ.get("MM_B2_APPLICATION_KEY_ID"),
+            B2_APPLICATION_KEY=os.environ.get("MM_B2_APPLICATION_KEY"),
+        )
+        self.api = MediaViewerClient(
+            args.api_url,
+            os.environ.get("MM_API_USERNAME"),
+            os.environ.get("MM_API_PASSWORD"),
+            os.environ.get("MM_API_TOKEN"),
+        )
+        self.run_id = None
+        self.ownership_retained = False
 
     def run(self):
-        from django.db import connection
-        from mediaviewer.models import MediaPath
+        if (not isinstance(self.args.batch_size, int) or isinstance(self.args.batch_size, bool)
+                or not 1 <= self.args.batch_size <= MAX_BATCH_SIZE):
+            raise ValueError(f"batch size must be between 1 and {MAX_BATCH_SIZE}")
         if self.args.apply:
-            if connection.vendor != "postgresql":
-                raise RuntimeError("apply requires PostgreSQL")
-            if not (getattr(self.settings, "B2_APPLICATION_KEY_ID", None) and getattr(self.settings, "B2_APPLICATION_KEY", None)):
+            if not getattr(self.args, "writers_paused", False):
+                raise RuntimeError("apply requires writers-paused acknowledgement")
+            if not (self.settings.B2_APPLICATION_KEY_ID and self.settings.B2_APPLICATION_KEY):
                 raise RuntimeError("B2 credentials are required for apply")
-            if not (self.args.bucket or getattr(self.settings, "B2_BUCKET_NAME", None)):
-                raise RuntimeError("a B2 bucket is required for apply")
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", [LOCK_NAMESPACE, LOCK_KEY])
-                acquired = cursor.fetchone()[0]
-            if not acquired:
-                raise RuntimeError("another MediaMigrate run holds the advisory lock")
+            self.run_id = str(uuid.uuid4())
             try:
-                return self._run_candidates(MediaPath)
-            finally:
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [LOCK_NAMESPACE, LOCK_KEY])
-        return self._run_candidates(MediaPath)
+                self.api.acquire_run(self.run_id)
+            except Exception:
+                print(f"MediaViewer run ownership may have been acquired; run_id={self.run_id}. Inspect active ownership before recovery.", file=sys.stderr)
+                raise
+            self.ownership_retained = True
+        try:
+            records = self.api.candidates(self.args.batch_size, self.args.bucket, self.args.prefix)
+            self._run_candidates(records)
+        except Exception:
+            if self.args.apply:
+                print(f"MediaViewer run ownership retained; run_id={self.run_id}. Confirm the old process and uploads stopped before manual recovery.", file=sys.stderr)
+            raise
+        if self.args.apply:
+            if self.summary.failed:
+                print(f"MediaViewer run ownership retained; run_id={self.run_id}. Confirm the old process and uploads stopped before manual recovery.", file=sys.stderr)
+            else:
+                try:
+                    self.api.release_run(self.run_id)
+                    self.ownership_retained = False
+                except Exception:
+                    print(f"MediaViewer run ownership retained; run_id={self.run_id}. Confirm the old process and uploads stopped before manual recovery.", file=sys.stderr)
+                    raise
+        return self.summary
 
-    def _run_candidates(self, MediaPath):
-        from django.db.models import Q
-        qs = (MediaPath.objects.filter(skip=False).exclude(_path__startswith="b2://")
-              .exclude(_path="").filter(Q(tv__isnull=False) | Q(movie__isnull=False)).order_by("pk"))
-        candidates = list(qs[: self.args.batch_size])
-        for parent in candidates:
+    def _run_candidates(self, records):
+        for raw in records:
+            pk = raw.get("pk", "unknown") if isinstance(raw, dict) else "unknown"
+            self.summary.attempted += 1
             try:
-                self.summary.attempted += 1
+                if not isinstance(raw, dict):
+                    raise TypeError("candidate must be an object")
+                if "error" in raw:
+                    raise ValueError(str(raw["error"]))
+                parent = self._record(raw)
                 plan = self._plan(parent)
                 if self.args.apply:
                     self._execute(plan)
-                    self.summary.succeeded += 1
                 else:
-                    self.summary.succeeded += 1
                     print(f"would migrate MediaPath {parent.pk}")
+                self.summary.succeeded += 1
             except Exception as exc:  # noqa: BLE001 - record failures must not stop the bounded batch
                 self.summary.failed += 1
-                print(f"MediaPath {parent.pk}: {exc.__class__.__name__}: {safe_message(exc, self.settings)}", file=sys.stderr)
+                print(f"MediaPath {pk}: {exc.__class__.__name__}: {safe_message(exc, self.settings)}", file=sys.stderr)
         return self.summary
 
+    @staticmethod
+    def _record(raw):
+        required = ("pk", "path", "tv", "movie", "filename", "subtitle_files", "children", "snapshot", "target")
+        if any(key not in raw for key in required):
+            raise ValueError("candidate is missing required fields")
+        if (not isinstance(raw["pk"], int) or isinstance(raw["pk"], bool) or raw["pk"] < 1
+                or not isinstance(raw["path"], str) or not raw["path"]):
+            raise ValueError("candidate identity or path is malformed")
+        if (not isinstance(raw["snapshot"], str) or not raw["snapshot"]
+                or (raw["filename"] is not None and not isinstance(raw["filename"], str))):
+            raise ValueError("candidate snapshot or filename is malformed")
+        for key in ("tv", "movie"):
+            value = raw[key]
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+                raise ValueError("candidate TV/movie identity is malformed")
+        if (raw["tv"] is None) == (raw["movie"] is None):
+            raise ValueError("candidate must reference exactly one TV or movie")
+        if not isinstance(raw["children"], list) or not isinstance(raw["target"], dict):
+            raise TypeError("candidate children or target is malformed")
+        target = raw["target"]
+        if any(not isinstance(target.get(k), str) or not target[k] for k in ("bucket", "path", "b2_upload_prefix")):
+            raise ValueError("candidate B2 target is malformed")
+        children = []
+        child_ids = set()
+        for child in raw["children"]:
+            if not isinstance(child, dict) or not all(k in child for k in ("pk", "filename", "b2_uuid", "size", "subtitle_files")):
+                raise ValueError("candidate child is malformed")
+            child_pk = child["pk"]
+            if not isinstance(child_pk, int) or isinstance(child_pk, bool) or child_pk < 1 or child_pk in child_ids:
+                raise ValueError("candidate child identity is malformed or duplicated")
+            if not isinstance(child["filename"], str) or not child["filename"]:
+                raise ValueError("candidate child filename is malformed")
+            if child["b2_uuid"] is not None and not isinstance(child["b2_uuid"], str):
+                raise ValueError("candidate child B2 identity is malformed")
+            if child["size"] is not None and (not isinstance(child["size"], int)
+                                               or isinstance(child["size"], bool) or child["size"] < 0):
+                raise ValueError("candidate child size is malformed")
+            if child["subtitle_files"] is not None and not isinstance(child["subtitle_files"], list):
+                raise ValueError("candidate child subtitles are malformed")
+            child_ids.add(child_pk)
+            children.append(SimpleNamespace(**child))
+        return SimpleNamespace(
+            pk=raw["pk"], _path=raw["path"], tv_id=raw.get("tv"), movie_id=raw.get("movie"),
+            filename=raw["filename"], subtitle_files=raw["subtitle_files"], children=children,
+            snapshot=raw["snapshot"], target=target,
+        )
+
     def _plan(self, parent):
-        from mediaviewer.models import MediaFile
         if bool(parent.tv_id) == bool(parent.movie_id):
             raise ValueError("path must reference exactly one TV or movie record")
         if parent.filename and parent.tv_id:
@@ -96,7 +153,7 @@ class MigrationRunner:
         if not root.exists() or not root.is_dir():
             raise ValueError("media directory is missing")
         root = root.resolve(strict=True)
-        children = list(MediaFile.objects.filter(media_path_id=parent.pk).order_by("pk"))
+        children = parent.children
         if any(getattr(child, "b2_uuid", None) for child in children):
             raise ValueError("legacy path has partial B2 metadata")
         if parent.tv_id and not children:
@@ -106,8 +163,6 @@ class MigrationRunner:
             for child in children:
                 selected.append((child, self._contained(root, child.filename)))
         else:
-            if not parent.movie:
-                raise ValueError("movie reference is missing")
             if parent.filename:
                 movie_path = self._contained(root, parent.filename)
                 if movie_path.suffix.lower() not in VIDEO_SUFFIXES:
@@ -137,14 +192,12 @@ class MigrationRunner:
             for metadata in (parent_subtitles, child_subtitles):
                 if metadata is not None and not isinstance(metadata, list):
                     raise ValueError("subtitle metadata must be a list")
-            explicit_subtitles = [*(parent_subtitles or []), *(child_subtitles or [])]
-            subtitles = self._subtitles(root, video, explicit_subtitles)
+            subtitles = self._subtitles(root, video, [*(parent_subtitles or []), *(child_subtitles or [])])
             from mediamigrate.media import inspect_video, source_fingerprint
             inspect_video(video, subtitles)
             fingerprint = source_fingerprint(video, subtitles)
             plans.append({"child": child, "video": video, "subtitles": subtitles, "fingerprint": fingerprint})
-        return {"parent": parent, "children": children, "plans": plans, "root": root,
-                "snapshot": snapshot(parent, children)}
+        return {"parent": parent, "children": children, "plans": plans, "root": root}
 
     @staticmethod
     def _contained(root, filename):
@@ -171,97 +224,49 @@ class MigrationRunner:
             if not candidate.is_file():
                 continue
             base = candidate.name[: -len(candidate.suffix)]
-            matched = any(
-                base == stem or base.startswith((stem + ".", stem + "-"))
-                for stem in stems
-            )
-            if not matched:
+            if not any(base == stem or base.startswith((stem + ".", stem + "-")) for stem in stems):
                 continue
             if candidate.suffix.lower() != ".vtt":
-                if candidate.suffix.lower() in {
-                    ".srt", ".ass", ".ssa", ".sub", ".idx", ".sup"
-                }:
+                if candidate.suffix.lower() in {".srt", ".ass", ".ssa", ".sub", ".idx", ".sup"}:
                     raise ValueError("matched subtitle sidecar must be WebVTT")
                 continue
             names.append(candidate.name)
-        names = sorted(set(names))
-        result = []
-        for name in dict.fromkeys(names):
-            result.append(self._contained(root, name))
-        return result
+        return [self._contained(root, name) for name in sorted(set(names))]
 
     def _execute(self, plan):
-        from django.db import transaction
-        from mediaviewer.b2 import get_b2_client
-        from mediaviewer.models import MediaFile, MediaPath
-
         from mediamigrate.media import prepare_video
         parent = plan["parent"]
         prepared = []
         for item in plan["plans"]:
             result = prepare_video(item["video"], item["subtitles"])
-            if (
-                Path(result.video).resolve() != item["video"]
-                or tuple(Path(p).resolve() for p in result.subtitles)
-                != tuple(item["subtitles"])
-                or result.fingerprint != item["fingerprint"]
-            ):
+            if (Path(result.video).resolve() != item["video"]
+                    or tuple(Path(p).resolve() for p in result.subtitles) != tuple(item["subtitles"])
+                    or result.fingerprint != item["fingerprint"]):
                 raise RuntimeError("preparation must preserve original media files")
             prepared.append((item, result))
-        # Compute planned storage prefix through MediaViewer's own sharding logic.
-        staged_parent = copy.copy(parent)
-        prefix = self.args.prefix if self.args.prefix is not None else getattr(self.settings, "B2_NAME_PREFIX", "")
-        local_root = plan["root"].name
-        bucket = self.args.bucket or self.settings.B2_BUCKET_NAME
-        logical_key_prefix = f"{prefix.rstrip('/') + '/' if prefix else ''}{parent.pk}/{local_root}/"
-        staged_parent._path = f"b2://{bucket}/{logical_key_prefix}"
-        object_prefix = staged_parent.b2_upload_prefix
-        client = get_b2_client()
-        updates = []
         verify_sources(plan)
+        from .b2 import B2Client
+        client = B2Client(self.settings.B2_APPLICATION_KEY_ID, self.settings.B2_APPLICATION_KEY,
+                          os.environ.get("MM_B2_API_URL"))
+        target = parent.target
+        bucket, prefix = target["bucket"], target["b2_upload_prefix"]
+        files = []
         for item, output in prepared:
             child = item["child"]
             identity = f"{parent.pk}:mediafile:{child.pk}" if child else f"{parent.pk}:movie:{parent.movie_id}"
-            uid = object_uuid(identity, item["fingerprint"], output.video)
-            video_key = f"{object_prefix}{uid}{item['video'].suffix}"
-            upload_verified(client, output.video, bucket, video_key)
+            uid = str(object_uuid(identity, item["fingerprint"], output.video))
+            upload_verified(client, output.video, bucket, f"{prefix}{uid}{item['video'].suffix}")
             subtitle_ids = []
             for subtitle in output.subtitles:
-                sid = object_uuid(identity, item["fingerprint"], subtitle)
-                upload_verified(client, subtitle, bucket, f"{object_prefix}{sid}.vtt")
+                sid = str(object_uuid(identity, item["fingerprint"], subtitle))
+                upload_verified(client, subtitle, bucket, f"{prefix}{sid}.vtt")
                 subtitle_ids.append(f"{sid}.vtt")
-            updates.append((child, uid, Path(output.video).stat().st_size, subtitle_ids))
+            files.append({"pk": child.pk if child else None, "filename": item["video"].name,
+                          "b2_uuid": uid, "size": Path(output.video).stat().st_size,
+                          "subtitle_files": subtitle_ids})
+        manifest = {"run_id": self.run_id, "snapshot": parent.snapshot, "files": files}
         verify_sources(plan)
-        with transaction.atomic():
-            locked = MediaPath.objects.select_for_update().get(pk=parent.pk)
-            current = list(MediaFile.objects.select_for_update().filter(media_path_id=parent.pk).order_by("pk"))
-            if snapshot(locked, current) != plan["snapshot"]:
-                raise RuntimeError("database snapshot changed before publication")
-            # Recheck all source input fingerprints at publication boundary.
-            verify_sources(plan)
-            locked._path = f"b2://{bucket}/{logical_key_prefix}"
-            if locked.movie_id:
-                locked.filename = plan["plans"][0]["video"].name
-                locked.subtitle_files = updates[0][3]
-            locked.save(update_fields=["_path", "filename", "subtitle_files"])
-            for child, uid, size, subtitles in updates:
-                if child is None:
-                    child = MediaFile(media_path=locked, filename=plan["plans"][0]["video"].name)
-                    child.b2_uuid = uid
-                    child.size = size
-                    child.subtitle_files = subtitles
-                    child.save()
-                    continue
-                child.b2_uuid = uid
-                child.size = size
-                child.subtitle_files = subtitles
-                child.save(update_fields=["b2_uuid", "size", "subtitle_files"])
-
-
-def snapshot(parent, children):
-    def values(obj):
-        return tuple((field.attname, repr(getattr(obj, field.attname))) for field in obj._meta.concrete_fields)
-    return values(parent), tuple(values(child) for child in children)
+        self.api.publish(parent.pk, manifest)
 
 
 def verify_sources(plan):
@@ -278,4 +283,8 @@ def safe_message(error, settings=None):
         secret = getattr(settings, name, None) if settings is not None else None
         if secret:
             message = message.replace(str(secret), "[REDACTED]")
+    for name in ("MM_API_PASSWORD", "MM_API_TOKEN", "MM_B2_APPLICATION_KEY_ID", "MM_B2_APPLICATION_KEY"):
+        secret = os.environ.get(name)
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
     return message[:240] or error.__class__.__name__
