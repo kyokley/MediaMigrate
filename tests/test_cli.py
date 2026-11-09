@@ -5,10 +5,14 @@ import pytest
 from mediamigrate.cli import parser, positive_integer
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "1.5", "no"])
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "no", "1001"])
 def test_batch_size_requires_positive_integer(value):
     with pytest.raises(argparse.ArgumentTypeError):
         positive_integer(value)
+
+
+def test_batch_limit_accepts_maximum():
+    assert positive_integer("1000") == 1000
 
 
 def test_cli_is_dry_run_and_acknowledgement_is_explicit():

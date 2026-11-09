@@ -1,9 +1,11 @@
 import argparse
+import os
 import re
 import sys
-from pathlib import Path
 
 from .runner import MigrationRunner
+
+MAX_BATCH_SIZE = 1000
 
 
 def positive_integer(value):
@@ -11,16 +13,15 @@ def positive_integer(value):
         number = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("batch size must be a positive integer") from exc
-    if number < 1:
-        raise argparse.ArgumentTypeError("batch size must be a positive integer")
+    if not 1 <= number <= MAX_BATCH_SIZE:
+        raise argparse.ArgumentTypeError(f"batch size must be between 1 and {MAX_BATCH_SIZE}")
     return number
 
 
 def parser():
     result = argparse.ArgumentParser(prog="mediamigrate")
     result.add_argument("batch_size", type=positive_integer)
-    result.add_argument("--mediaviewer", type=Path)
-    result.add_argument("--settings", default="mysite.settings")
+    result.add_argument("--api-url", default=os.environ.get("MM_API_URL"))
     result.add_argument("--bucket")
     result.add_argument("--prefix")
     result.add_argument("--apply", action="store_true", help="upload and publish; default is dry-run")
@@ -37,8 +38,6 @@ def main(argv=None):
     if args.apply and not args.writers_paused:
         print("apply requires --writers-paused acknowledgement", file=sys.stderr)
         return 2
-    if args.mediaviewer is None:
-        args.mediaviewer = Path(__file__).resolve().parents[2] / "MediaViewer"
     runner = None
     try:
         runner = MigrationRunner(args)
@@ -54,8 +53,14 @@ def safe_error(error, settings=None):
     # Avoid exposing credentials, signed URLs, or exception data from HTTP clients.
     message = str(error).split("?", 1)[0]
     message = re.sub(r"https?://\S+", "[URL]", message)
+    secrets = [os.environ.get(name) for name in (
+        "MM_API_PASSWORD", "MM_API_TOKEN", "MM_B2_APPLICATION_KEY_ID", "MM_B2_APPLICATION_KEY"
+    )]
     for name in ("B2_APPLICATION_KEY_ID", "B2_APPLICATION_KEY"):
         secret = getattr(settings, name, None) if settings is not None else None
         if secret:
+            secrets.append(str(secret))
+    for secret in secrets:
+        if secret:
             message = message.replace(str(secret), "[REDACTED]")
-    return message[:300] if settings is not None else error.__class__.__name__
+    return message[:300] or error.__class__.__name__

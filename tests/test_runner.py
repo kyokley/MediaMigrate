@@ -1,6 +1,5 @@
-import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -88,72 +87,107 @@ def test_malformed_subtitle_metadata_is_rejected(tmp_path):
         runner(tmp_path)._subtitles(root, video, {"captions": "x.vtt"})
 
 
-def test_snapshot_includes_all_model_fields():
-    class Field:
-        def __init__(self, name):
-            self.attname = name
-    class Meta:
-        def __init__(self):
-            self.concrete_fields = [Field("pk"), Field("date_edited")]
-    class Record:
-        _meta = Meta()
-        pk = 1
-        date_edited = "now"
-    from mediamigrate.runner import snapshot
-    assert snapshot(Record(), []) == ((('pk', '1'), ('date_edited', "'now'")), ())
-
-
-def test_batch_bound_counts_failed_candidates_in_primary_key_order(monkeypatch):
-    class Q:
-        def __init__(self, **kwargs):
-            pass
-
-        def __or__(self, other):
-            return self
-
-    class QuerySet:
-        def __init__(self):
-            self.records = [SimpleNamespace(pk=1), SimpleNamespace(pk=2), SimpleNamespace(pk=3)]
-
-        def filter(self, *args, **kwargs):
-            return self
-
-        def exclude(self, **kwargs):
-            return self
-
-        def order_by(self, *args):
-            return self
-
-        def __getitem__(self, item):
-            return self.records[item]
-
-    django = ModuleType("django")
-    django_db = ModuleType("django.db")
-    django_models = ModuleType("django.db.models")
-    django_models.Q = Q
-    monkeypatch.setitem(sys.modules, "django", django)
-    monkeypatch.setitem(sys.modules, "django.db", django_db)
-    monkeypatch.setitem(sys.modules, "django.db.models", django_models)
-    from mediamigrate.runner import Summary
-
-    class MediaPath:
-        objects = QuerySet()
-
+def test_batch_counts_invalid_candidates_and_continues(capsys):
     subject = runner(Path("."))
-    subject.args.batch_size = 2
-    subject.args.apply = False
+    from mediamigrate.runner import Summary
     subject.summary = Summary()
     subject.settings = None
-    attempted = []
+    subject.args = SimpleNamespace(apply=False)
+    candidates = [{"pk": 1, "error": "bad record"}, {"pk": 2, "error": "bad record"}]
+    summary = subject._run_candidates(candidates)
+    assert (summary.attempted, summary.succeeded, summary.failed) == (2, 0, 2)
+    assert "MediaPath 1" in capsys.readouterr().err
 
-    def plan(record):
-        attempted.append(record.pk)
-        if record.pk == 1:
-            raise ValueError("bad record")
-        return {"parent": record}
 
-    monkeypatch.setattr(subject, "_plan", plan)
-    monkeypatch.setattr(subject, "_execute", lambda plan: pytest.fail("dry-run wrote data"))
-    summary = subject._run_candidates(MediaPath)
-    assert attempted == [1, 2]
-    assert (summary.attempted, summary.succeeded, summary.failed) == (2, 1, 1)
+@pytest.mark.parametrize("filename", [None, ""])
+def test_candidate_parser_keeps_all_api_inventory_children(filename):
+    from mediamigrate.runner import MigrationRunner
+    parent = MigrationRunner._record({
+        "pk": 9, "path": "/media/show", "tv": 4, "movie": None, "filename": filename,
+        "subtitle_files": [], "snapshot": "opaque", "target": {
+            "bucket": "bucket", "path": "b2://bucket/key/", "b2_upload_prefix": "key/"},
+        "children": [{"pk": 11, "filename": "hidden.mkv", "b2_uuid": None,
+                      "size": 5, "subtitle_files": []}],
+    })
+    assert parent.children[0].pk == 11
+    assert parent.children[0].filename == "hidden.mkv"
+
+
+def test_dry_run_needs_no_b2_credentials_or_write_endpoints(monkeypatch, capsys):
+    from mediamigrate.runner import MigrationRunner
+    events = []
+
+    class API:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def candidates(self, *args):
+            events.append("inventory")
+            return []
+
+        def acquire_run(self, *_):
+            pytest.fail("dry run acquired ownership")
+
+    monkeypatch.setattr("mediamigrate.runner.MediaViewerClient", API)
+    monkeypatch.delenv("MM_B2_APPLICATION_KEY_ID", raising=False)
+    monkeypatch.delenv("MM_B2_APPLICATION_KEY", raising=False)
+    subject = MigrationRunner(SimpleNamespace(api_url="https://viewer/api/", apply=False,
+                                              batch_size=2, bucket=None, prefix=None))
+    summary = subject.run()
+    assert (summary.attempted, summary.succeeded, summary.failed) == (0, 0, 0)
+    assert events == ["inventory"]
+    assert capsys.readouterr().out == ""
+
+
+def test_programmatic_batch_over_limit_fails_before_ownership(monkeypatch):
+    from mediamigrate.runner import MigrationRunner
+    events = []
+
+    class API:
+        MAX_BATCH = 1000
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def acquire_run(self, *_):
+            events.append("acquire")
+
+    monkeypatch.setattr("mediamigrate.runner.MediaViewerClient", API)
+    monkeypatch.setenv("MM_B2_APPLICATION_KEY_ID", "id")
+    monkeypatch.setenv("MM_B2_APPLICATION_KEY", "key")
+    subject = MigrationRunner(SimpleNamespace(api_url="https://viewer/api/", apply=True,
+                                              writers_paused=True, batch_size=1001,
+                                              bucket=None, prefix=None))
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        subject.run()
+    assert events == []
+
+
+@pytest.mark.parametrize("change", [
+    {"pk": True}, {"pk": "1"}, {"tv": 0}, {"movie": "2"}, {"snapshot": ""},
+    {"filename": 123},
+])
+def test_candidate_parser_rejects_malformed_identifiers_and_fields(change):
+    from mediamigrate.runner import MigrationRunner
+    raw = {
+        "pk": 1, "path": "/media", "tv": 2, "movie": None, "filename": "",
+        "subtitle_files": [], "snapshot": "opaque", "target": {
+            "bucket": "bucket", "path": "b2://bucket/key/", "b2_upload_prefix": "key/"},
+        "children": [],
+    }
+    raw.update(change)
+    with pytest.raises(ValueError):
+        MigrationRunner._record(raw)
+
+
+def test_candidate_parser_rejects_duplicate_child_ids():
+    from mediamigrate.runner import MigrationRunner
+    child = {"pk": 4, "filename": "e.mkv", "b2_uuid": None, "size": None, "subtitle_files": []}
+    raw = {
+        "pk": 1, "path": "/media", "tv": 2, "movie": None, "filename": "",
+        "subtitle_files": [], "snapshot": "opaque", "target": {
+            "bucket": "bucket", "path": "b2://bucket/key/", "b2_upload_prefix": "key/"},
+        "children": [child, dict(child)],
+    }
+    with pytest.raises(ValueError, match="duplicated"):
+        MigrationRunner._record(raw)
